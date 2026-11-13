@@ -1,0 +1,629 @@
+package app.rork.p7buzvrzcw3frddi8y50ou.sim
+
+import app.rork.p7buzvrzcw3frddi8y50ou.Diagnostics
+import app.rork.p7buzvrzcw3frddi8y50ou.data.BuildingDef
+import app.rork.p7buzvrzcw3frddi8y50ou.data.BuildingDirectory
+import app.rork.p7buzvrzcw3frddi8y50ou.data.ContentRegistry
+import app.rork.p7buzvrzcw3frddi8y50ou.data.CreatureDef
+import app.rork.p7buzvrzcw3frddi8y50ou.data.LogicalBuilding
+import app.rork.p7buzvrzcw3frddi8y50ou.data.NpcDef
+import app.rork.p7buzvrzcw3frddi8y50ou.data.ProfessionDef
+import app.rork.p7buzvrzcw3frddi8y50ou.data.hexToRgb
+import app.rork.p7buzvrzcw3frddi8y50ou.procgen.BuildingCache
+import app.rork.p7buzvrzcw3frddi8y50ou.sim.systems.CombatSystem
+import app.rork.p7buzvrzcw3frddi8y50ou.sim.systems.CraftingSystem
+import app.rork.p7buzvrzcw3frddi8y50ou.sim.systems.CreatureSystem
+import app.rork.p7buzvrzcw3frddi8y50ou.sim.systems.DialogueSystem
+import app.rork.p7buzvrzcw3frddi8y50ou.sim.systems.DiscoverySystem
+import app.rork.p7buzvrzcw3frddi8y50ou.sim.systems.GoalSystem
+import app.rork.p7buzvrzcw3frddi8y50ou.sim.systems.HouseholdSystem
+import app.rork.p7buzvrzcw3frddi8y50ou.sim.systems.InteractionSystem
+import app.rork.p7buzvrzcw3frddi8y50ou.sim.systems.InventorySystem
+import app.rork.p7buzvrzcw3frddi8y50ou.sim.systems.KinshipSystem
+import app.rork.p7buzvrzcw3frddi8y50ou.sim.systems.NeedsSystem
+import app.rork.p7buzvrzcw3frddi8y50ou.sim.systems.NpcSystem
+import app.rork.p7buzvrzcw3frddi8y50ou.sim.systems.PlayerSystem
+import app.rork.p7buzvrzcw3frddi8y50ou.sim.systems.ProgressionSystem
+import app.rork.p7buzvrzcw3frddi8y50ou.sim.systems.PropertySystem
+import app.rork.p7buzvrzcw3frddi8y50ou.sim.systems.Dest
+import app.rork.p7buzvrzcw3frddi8y50ou.sim.systems.ScheduleSystem
+import app.rork.p7buzvrzcw3frddi8y50ou.sim.systems.SocialSystem
+import app.rork.p7buzvrzcw3frddi8y50ou.sim.systems.TimeSystem
+import app.rork.p7buzvrzcw3frddi8y50ou.sim.systems.TradeSystem
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.max
+import kotlin.math.sin
+import kotlin.math.sqrt
+
+/** Game minutes that pass per real second: one in-game day lasts 48 real minutes. */
+const val MIN_PER_SEC = 0.5f
+const val TWO_PI = 6.2831855f
+
+/** A villager in the running world: definition, saved state, and what is only needed while playing. */
+class Npc(val def: NpcDef, val prof: ProfessionDef, val s: NpcState) {
+    var yaw = 0f
+    var phase = 0f
+    var moving = false
+    val path = ArrayDeque<FloatArray>()
+    var decideAt = 0.0
+    var nextSocialAt = 0.0
+    var accum = 0f
+    var pause = 0f
+    var wageAcc = 0f
+    var destName = ""
+    var destLabel = ""
+    var homeDoor = floatArrayOf(0f, 0f)
+    var homeName = ""
+    var workPos: FloatArray? = null
+    var workGate = ""
+    var workName = ""
+    var skinHex = "#D9A77F"
+    var clothHex = "#7A6548"
+    var hat = false
+    var skin = floatArrayOf(0.85f, 0.65f, 0.5f)
+    var cloth = floatArrayOf(0.5f, 0.4f, 0.3f)
+    var hair = floatArrayOf(0.3f, 0.2f, 0.1f)
+
+    // ---- living-world simulation (runtime only; the save keeps needs, action and lastSim)
+    /** Which simulation tier this person is in right now: 0 active, 1 regional, 2 distant. */
+    var tier = 1
+    /** Where this person's doorway sits relative to their building, so neighbours do not overlap. */
+    var spread = 0f
+    var spreadAlt = 0f
+    /** Need decay multipliers, from the person and their trade: hunger, fatigue, social. */
+    val rates = floatArrayOf(1f, 1f, 1f)
+    /** Resolved schedule destinations, by the window's target word. */
+    val destCache = HashMap<String, Dest?>()
+    /** Which leg of a patrol they are walking. */
+    var patrolLeg = 0
+    /** World minute their current walk began; a walk still going far too long is given up on. */
+    var travelSince = 0.0
+    /** World minute they last looked around for a co-worker to share the day with. */
+    var nextWorkCheck = 0.0
+    /** The activity a failed window falls back to. */
+    var lastFallback = ""
+    fun trait(name: String) = def.personality[name] ?: 0.5f
+}
+
+/**
+ * The chair the player is sitting in, while they sit in it. Purely transient — the save knows
+ * nothing of chairs — with a stage that animates sitting down (0→1) and standing up (1→0).
+ */
+class Seat(val x: Float, val z: Float, val floorY: Float, val yaw: Float) {
+    var stage = 0f
+    /** Set when the player stands: the stage runs back down before the seat lets go. */
+    var leaving = false
+}
+
+class Creature(val def: CreatureDef, val s: CreatureState) {
+    var yaw = 0f
+    var phase = 0f
+    var tx = 0f
+    var tz = 0f
+    var cooldown = 0f
+    var retarget = 0f
+    val color = hexToRgb(def.color)
+}
+
+class Box(val cx: Float, val cz: Float, val hw: Float, val hd: Float, val cos: Float, val sin: Float)
+
+/** What the Use button would act on. kind is npc, resource, building or object. */
+class Target(val kind: String, val id: String, val label: String)
+
+/**
+ * Everything the systems share: the content, the save, the world's random sequence, the live
+ * villagers and creatures, and the few values that exist only while the game runs. Systems hold
+ * no world state of their own beyond timers, so the save plus this context is the whole world.
+ */
+class World(
+    val content: ContentRegistry,
+    val save: SaveGame,
+    val input: InputState,
+    val events: MutableSharedFlow<UiEvent>,
+) {
+    val rng = WorldRng(save)
+    val p: PlayerState get() = save.player
+
+    val npcs = ArrayList<Npc>()
+    val npcById = HashMap<String, Npc>()
+    val creatures = ArrayList<Creature>()
+    val boxes = ArrayList<Box>()
+    val inn: BuildingDef? = content.buildings.values.firstOrNull { it.type == "inn" }
+    val shop: BuildingDef? = content.buildings.values.firstOrNull { it.type == "shop" }
+
+    /** The semantic layer: classifications, functional zones, rooms and ext/int instance ids per building. */
+    val buildingLogic = BuildingDirectory(content)
+
+    /** The interior-instance system: entrances, the one loaded interior, transitions. */
+    val interiors = InteriorSystem(this)
+
+    // Runtime only. None of this is saved.
+    var vy = 0f
+    var grounded = true
+    var swimming = false
+    var walkPhase = 0f
+    var attackCooldown = 0f
+    var swing = 0f
+
+    // Body language, all transient. The renderer reads these through the frame snapshot.
+    /** Smoothed walk→run blend, 0..1, so starting and stopping read naturally. */
+    var moveIntensity = 0f
+    /** Smoothed lean into turns, + = right, degrees. */
+    var turnLean = 0f
+    /** Current hand action (an [ActorAction] constant, 0 when none) and its stage 0..1. */
+    var handAction = 0
+    var handStage = 0f
+    /** Seconds left to keep brandishing after a pick completes. */
+    var handHold = 0f
+    /** The chair the player occupies, while they sit. */
+    var seat: Seat? = null
+    var target: Target? = null
+    var hostile: Creature? = null
+    var packDirty = true
+    var journalDirty = true
+    @Volatile var fps = 0
+
+    lateinit var progression: ProgressionSystem
+    lateinit var inventory: InventorySystem
+    lateinit var player: PlayerSystem
+    lateinit var needs: NeedsSystem
+    lateinit var combat: CombatSystem
+    lateinit var dialogue: DialogueSystem
+    lateinit var trade: TradeSystem
+    lateinit var interaction: InteractionSystem
+    lateinit var crafting: CraftingSystem
+    lateinit var npcSim: NpcSystem
+    lateinit var creatureSim: CreatureSystem
+    lateinit var time: TimeSystem
+    lateinit var discovery: DiscoverySystem
+    lateinit var schedules: ScheduleSystem
+    lateinit var social: SocialSystem
+    // Safe defaults, so tests and partial worlds may run without the engine's full wiring;
+    // the engine reassigns these and binds them in order when a real game starts.
+    var kin: KinshipSystem = KinshipSystem(this)
+    var households: HouseholdSystem = HouseholdSystem(this)
+    var goals: GoalSystem = GoalSystem(this)
+    var properties: PropertySystem = PropertySystem(this)
+
+    init {
+        for (b in content.buildings.values) {
+            // A procedural building's collision box is its generated ground footprint; the
+            // definition's w/d stay the fallback (and shape the door point) when none was grown.
+            val fp = if (b.procedural) BuildingCache.footprint(b) else null
+            val hw = (fp?.first ?: b.w) / 2f
+            val hd = (fp?.second ?: b.d) / 2f
+            val r = atan2(b.x, b.z)
+            boxes += Box(b.x, b.z, hw, hd, cos(r), sin(r))
+        }
+    }
+
+    fun toast(text: String) {
+        events.tryEmit(UiEvent.Toast(text))
+    }
+
+    /** Adds a line to the village chronicle. */
+    fun record(text: String) {
+        save.history += WorldEvent(save.minutes, text)
+        while (save.history.size > 80) save.history.removeAt(0)
+        journalDirty = true
+    }
+
+    /** The point in front of a building's door. Doors face the village square. */
+    fun doorOf(b: BuildingDef, side: Float = 0f): FloatArray {
+        val len = sqrt(b.x * b.x + b.z * b.z).coerceAtLeast(0.01f)
+        val nx = b.x / len
+        val nz = b.z / len
+        val dist = b.d / 2f + 1.8f
+        return floatArrayOf(b.x - nx * dist - nz * side, b.z - nz * dist + nx * side)
+    }
+
+    fun groundY(x: Float, z: Float) = max(Terrain.height(x, z), Terrain.WATER - 0.55f)
+
+    /** Pushes a position out of any building it overlaps. */
+    fun collide(pos: FloatArray, radius: Float) {
+        for (b in boxes) {
+            val dx = pos[0] - b.cx
+            val dz = pos[1] - b.cz
+            if (abs(dx) > 14f || abs(dz) > 14f) continue
+            var lx = dx * b.cos - dz * b.sin
+            var lz = dx * b.sin + dz * b.cos
+            val px = b.hw + radius - abs(lx)
+            val pz = b.hd + radius - abs(lz)
+            if (px > 0f && pz > 0f) {
+                if (px < pz) {
+                    lx += if (lx >= 0f) px else -px
+                } else {
+                    lz += if (lz >= 0f) pz else -pz
+                }
+                pos[0] = b.cx + lx * b.cos + lz * b.sin
+                pos[1] = b.cz - lx * b.sin + lz * b.cos
+            }
+        }
+    }
+
+    /** Whoever keeps the inn, and so is paid for beds and suppers. */
+    fun innkeeper(): Npc? = npcs.firstOrNull { it.prof.workplace == "inn" && it.prof.trader }
+}
+
+/** A need held in a save: a satisfaction from 0 (dire) to 100 (content). */
+fun need(value: Float, fallback: Float): Float =
+    if (value.isNaN() || value.isInfinite()) fallback else value.coerceIn(0f, 100f)
+
+/**
+ * Brings a loaded save in line with the content that is loaded now: ids written before packs
+ * were namespaced are rewritten to their full form, and anything a newer game expects but an
+ * older save or a hand-edited file lacks is filled in. Ids that match nothing are left alone,
+ * so state from a pack that is switched off survives until the pack comes back.
+ */
+object SaveBinding {
+    private val LEGACY_SLOTS = mapOf("weapon" to "main_hand", "shield" to "off_hand")
+    private val LEGACY_SKILLS = mapOf("blade" to "blades", "block" to "blocking")
+
+    /** Unresolved ids are reported once each, not on every load and every pack change. */
+    private val loggedUnresolved = HashSet<String>()
+
+    private fun logUnresolved(kind: String, key: String, known: Boolean) {
+        if (known) return
+        synchronized(loggedUnresolved) {
+            if (loggedUnresolved.add("$kind:$key")) {
+                Diagnostics.record("save", "This save mentions the $kind '$key', which no loaded pack defines. It was kept as written, so a re-enabled pack finds it again.")
+            }
+        }
+    }
+
+    fun skillId(id: String) = LEGACY_SKILLS[id] ?: id
+
+    fun bind(save: SaveGame, content: ContentRegistry) {
+        val p = save.player
+        for (i in p.inventory.indices) {
+            val it = p.inventory[i]
+            val defId = content.items.canonical(it.defId)
+            val forged = it.forged?.let { f ->
+                val m = content.materials.canonical(f.materialId)
+                if (m != f.materialId) f.copy(materialId = m) else f
+            }
+            if (defId != it.defId || forged !== it.forged) p.inventory[i] = it.copy(defId = defId, forged = forged)
+        }
+        for ((old, new) in LEGACY_SLOTS) p.equipped.remove(old)?.let { uid -> if (new !in p.equipped) p.equipped[new] = uid }
+        for ((old, new) in LEGACY_SKILLS) p.skills.remove(old)?.let { v -> p.skills[new] = maxOf(v, p.skills[new] ?: 0f) }
+        p.race = content.races.canonical(p.race)
+        p.background = content.backgrounds.canonical(p.background)
+        if (p.appearance.skin.isBlank()) {
+            p.appearance.skin = (content.races[p.race] ?: content.races.values.firstOrNull())?.skinTones?.firstOrNull() ?: "#E0B08A"
+        }
+        if (p.level < 1) p.level = 1
+
+        for (i in save.npcs.indices) {
+            val n = save.npcs[i]
+            val id = content.npcs.canonical(n.id)
+            if (id != n.id) save.npcs[i] = n.copy(id = id)
+            val state = save.npcs[i]
+            if (state.bonds.keys.any { content.npcs.canonical(it) != it }) {
+                val bonds = state.bonds.entries.associate { content.npcs.canonical(it.key) to it.value }
+                state.bonds.clear()
+                state.bonds.putAll(bonds)
+            }
+            for (j in state.stock.indices) {
+                val e = state.stock[j]
+                val item = content.items.canonical(e.item)
+                if (item != e.item) state.stock[j] = e.copy(item = item)
+            }
+            state.sanitize(save.minutes)
+        }
+        for (i in save.creatures.indices) {
+            val c = save.creatures[i]
+            val def = content.creatures.canonical(c.defId)
+            if (def != c.defId) save.creatures[i] = c.copy(uid = "$def#${c.uid.substringAfterLast('#')}", defId = def)
+        }
+        for (key in save.harvested.keys.toList()) {
+            val id = content.resources.canonical(key)
+            if (id != key) save.harvested.remove(key)?.let { save.harvested[id] = it }
+        }
+
+        // Places, objects and creatures the save remembers are rewritten to full ids too.
+        // A discovery recorded twice, once under an old name, is one discovery; anything no
+        // pack defines is reported once and kept, never dropped in silence.
+        for (key in save.opened.keys.toList()) {
+            // Cooldown entries are stored as "cd:<object id>" and move with their object.
+            val cooldown = key.startsWith("cd:")
+            val bare = if (cooldown) key.substring(3) else key
+            val id = content.interactables.canonical(bare)
+            logUnresolved("object", bare, content.interactables[id] != null)
+            val newKey = if (cooldown) "cd:$id" else id
+            if (newKey == key) continue
+            val at = save.opened.remove(key)
+            if (at != null && newKey !in save.opened) save.opened[newKey] = at
+        }
+        for (key in save.discovered.keys.toList()) {
+            val id = content.locations.canonical(key)
+            logUnresolved("place", key, content.locations[id] != null)
+            if (id == key) continue
+            val at = save.discovered.remove(key)
+            if (at != null && id !in save.discovered) save.discovered[id] = at
+        }
+        for (key in save.bestiary.keys.toList()) {
+            val id = content.creatures.canonical(key)
+            logUnresolved("creature", key, content.creatures[id] != null)
+            if (id == key) continue
+            val entry = save.bestiary.remove(key)
+            if (entry != null && id !in save.bestiary) save.bestiary[id] = entry
+        }
+        for (i in save.rumours.indices) {
+            val r = save.rumours[i]
+            val id = content.rumours.canonical(r.id)
+            logUnresolved("rumour", r.id, content.rumours[id] != null)
+            if (id != r.id) save.rumours[i] = r.copy(id = id)
+        }
+        val seenRumours = HashSet<String>()
+        save.rumours.removeAll { !seenRumours.add(it.id) }
+
+        bindSocial(save, content)
+
+        bindProperties(save, content)
+
+        // Interiors: the visited-building ledger is keyed by instance id and carries a building
+        // reference; both are rewritten to full form, and a building nothing defines is reported
+        // and kept, as with every other reference.
+        for (key in save.interiors.keys.toList()) {
+            val rec = save.interiors[key] ?: continue
+            val bid = content.buildings.canonical(rec.buildingId)
+            logUnresolved("building", rec.buildingId, content.buildings[bid] != null)
+            rec.buildingId = bid
+            val newKey = "${LogicalBuilding.INTERIOR_PREFIX}$bid"
+            if (newKey == key) continue
+            save.interiors.remove(key)
+            if (newKey !in save.interiors) save.interiors[newKey] = rec
+        }
+        // The player's location: inside an instance id nothing resolves means they go back
+        // outside, at their recorded return spot, rather than stand in a room that no longer
+        // exists. A known id is rewritten to its full form.
+        val loc = p.location
+        if (loc.isNotEmpty()) {
+            val bid = loc.removePrefix(LogicalBuilding.INTERIOR_PREFIX)
+            val canon = content.buildings.canonical(bid)
+            if (content.buildings[canon] == null) {
+                logUnresolved("building", bid, false)
+                if (p.returnX != 0f || p.returnZ != 0f) {
+                    p.x = p.returnX; p.z = p.returnZ; p.yaw = p.returnYaw
+                } else {
+                    p.x = 0f; p.z = 122f; p.yaw = 0f
+                }
+                p.y = maxOf(p.returnY, Terrain.height(p.x, p.z))
+                p.location = ""
+            } else {
+                p.location = "${LogicalBuilding.INTERIOR_PREFIX}$canon"
+            }
+        }
+
+        if (save.rngState == 0L) save.rngState = if (save.seed != 0L) save.seed else 0x5EED5EEDL + save.nextUid
+    }
+
+    /**
+     * The social world is bound like everything else: ids rewritten to full form, self-opinions
+     * and references nothing defines resolved with a report rather than a quiet drop. Opinions
+     * are kept directional, so "a>b" and "b>a" are both legitimate and neither displaces the other.
+     */
+    /**
+     * Properties are bound like everything else: building references rewritten to full form,
+     * people resolved with a report rather than a quiet drop. A property about a building
+     * nothing defines has nothing to describe and is let go with its relationships; a building
+     * carried twice keeps the first; two live ownerships of one property resolve to the earliest
+     * begun. An ended relationship is kept — the deed is history, not error.
+     */
+    private fun bindProperties(save: SaveGame, content: ContentRegistry) {
+        fun canonicalNpc(id: String): String? = when {
+            id.isBlank() -> null
+            id == PLAYER_ID -> id
+            else -> content.npcs.canonical(id).takeIf { content.npcs[it] != null }
+        }
+
+        for (p in save.properties.toList()) {
+            val bid = content.buildings.canonical(p.buildingId)
+            if (content.buildings[bid] == null) {
+                logUnresolved("building", p.buildingId, false)
+                save.properties.remove(p)
+                continue
+            }
+            p.buildingId = bid
+        }
+        // One property to a building: the first recorded stays, the later copy is let go.
+        val seenBuildings = HashSet<String>()
+        for (p in save.properties.toList()) {
+            if (!seenBuildings.add(p.buildingId)) {
+                Diagnostics.record("save", "Two properties claimed the building '${p.buildingId}'. The second was let go.")
+                save.properties.remove(p)
+            }
+        }
+
+        val liveProperties = save.properties.map { it.id }.toSet()
+        val liveRels = HashSet<String>()
+        val activeOwners = HashMap<String, Pair<Double, PropertyRelationship>>()
+        for (r in save.propertyRels.toList()) {
+            if (r.propertyId !in liveProperties) {
+                logUnresolved("building", r.propertyId.removePrefix("prop:"), false)
+                save.propertyRels.remove(r)
+                continue
+            }
+            val party = canonicalNpc(r.partyId)
+            if (party == null) {
+                logUnresolved("person", r.partyId, false)
+                save.propertyRels.remove(r)
+                continue
+            }
+            r.partyId = party
+            if (r.principalId.isNotEmpty()) {
+                val principal = canonicalNpc(r.principalId)
+                if (principal == null) {
+                    logUnresolved("person", r.principalId, false)
+                    r.principalId = ""
+                } else {
+                    r.principalId = principal
+                }
+            }
+            if (r.id in liveRels) {
+                Diagnostics.record("save", "Two relationships claimed the id '${r.id}'. The second was let go.")
+                save.propertyRels.remove(r)
+                continue
+            }
+            liveRels.add(r.id)
+            r.sanitize()
+            // At most one live ownership to a property: the earliest begun holds the paper.
+            if (r.kind == PropRels.OWNERSHIP && r.isActive()) {
+                val prev = activeOwners[r.propertyId]
+                if (prev != null) {
+                    val (prevStart, prevRel) = prev
+                    val (keep, drop) = if (r.startMinute < prevStart) r to prevRel else prevRel to r
+                    Diagnostics.record("save", "The property '${r.propertyId}' was owned by two people. The earlier claim was kept.")
+                    save.propertyRels.remove(drop)
+                    activeOwners[r.propertyId] = keep.startMinute to keep
+                } else {
+                    activeOwners[r.propertyId] = r.startMinute to r
+                }
+            }
+        }
+    }
+
+    private fun bindSocial(save: SaveGame, content: ContentRegistry) {
+        fun canonicalNpc(id: String): String? = when {
+            id == PLAYER_ID -> PLAYER_ID
+            else -> content.npcs.canonical(id).takeIf { content.npcs[it] != null }
+        }
+
+        val social = save.social
+        // Opinions: rewrite both ends, drop a person's opinion of themselves, repair the measures.
+        for (key in social.relationships.keys.toList()) {
+            val rel = social.relationships[key] ?: continue
+            val holder = canonicalNpc(rel.holder.ifBlank { key.substringBefore('>') })
+            val other = canonicalNpc(rel.other.ifBlank { key.substringAfter('>') })
+            if (holder == null || other == null) {
+                social.relationships.remove(key)
+                logUnresolved("person", holder ?: rel.holder.ifBlank { key.substringBefore('>') }, holder != null)
+                if (other == null) logUnresolved("person", rel.other.ifBlank { key.substringAfter('>') }, false)
+                continue
+            }
+            if (holder == other) {
+                social.relationships.remove(key)
+                continue
+            }
+            rel.holder = holder
+            rel.other = other
+            rel.sanitize()
+            val newKey = "$holder>$other"
+            if (newKey != key) {
+                social.relationships.remove(key)
+                // A record already keyed the new way, perhaps from a merged pack, keeps the first.
+                if (social.relationships.containsKey(newKey)) {
+                    Diagnostics.record("save", "Two opinion records about '$holder' and '$other' were merged into one.")
+                } else {
+                    social.relationships[newKey] = rel
+                }
+            }
+        }
+
+        // Memories: the other people in each are canonicalised; a person nothing defines is
+        // reported and let go of that memory.
+        for (npc in save.npcs) {
+            for (j in npc.experiences.indices) {
+                val m = npc.experiences[j]
+                if (m.others.any { canonicalNpc(it) == null }) {
+                    for (o in m.others) if (canonicalNpc(o) == null) logUnresolved("person", o, false)
+                    npc.experiences[j] = m.copy(others = m.others.mapNotNull { canonicalNpc(it) })
+                }
+            }
+            npc.experiences.forEach { it.sanitize() }
+        }
+
+        // Stories: subject, source and every holder canonicalised; a story nobody holds anymore
+        // is reported once and removed.
+        for (g in social.gossip) {
+            val subject = canonicalNpc(g.subject)
+            if (subject == null) logUnresolved("person", g.subject, false) else g.subject = subject
+            val source = canonicalNpc(g.source)
+            if (source == null) logUnresolved("person", g.source, false) else g.source = source
+            val kept = LinkedHashMap<String, GossipKnowledge>()
+            for ((h, k) in g.holders) {
+                val id = canonicalNpc(h)
+                if (id == null) {
+                    logUnresolved("person", h, false)
+                } else kept.putIfAbsent(id, k)
+            }
+            g.holders.clear()
+            g.holders.putAll(kept)
+            g.sanitize()
+        }
+        val before = social.gossip.size
+        social.gossip.removeAll { it.holders.isEmpty() }
+        if (social.gossip.size < before) {
+            Diagnostics.record("save", "${before - social.gossip.size} story no one held anymore was let go.")
+        }
+
+        // Pair cooldowns: rewrite the ids, and let pairs that have not truly met in two days
+        // have their next encounter at once.
+        for (key in social.cooldowns.keys.toList()) {
+            val a = canonicalNpc(key.substringBefore('|'))
+            val b = canonicalNpc(key.substringAfter('|'))
+            if (a == null || b == null || a == b) {
+                social.cooldowns.remove(key)
+                continue
+            }
+            val newKey = if (a <= b) "$a|$b" else "$b|$a"
+            if (newKey != key) {
+                val at = social.cooldowns.remove(key)
+                if (at != null && newKey !in social.cooldowns) social.cooldowns[newKey] = at
+            }
+        }
+        social.cooldowns.entries.removeAll { save.minutes - it.value > 2880.0 }
+
+        // Chronicle milestones: their keys name a pair, so both ends are rewritten like the
+        // opinions above; a milestone about a person nothing defines has nothing to describe.
+        // The kind is split off at the last colon, for ids themselves carry colons.
+        for (key in social.milestones.toList()) {
+            val body = key.substringBeforeLast(':')
+            val kind = key.substringAfterLast(':', "")
+            val a = canonicalNpc(body.substringBefore('>'))
+            val b = canonicalNpc(body.substringAfter('>'))
+            val newKey = if (a == null || b == null || a == b || kind.isEmpty()) null else "$a>$b:$kind"
+            if (newKey == key) continue
+            social.milestones.remove(key)
+            if (newKey != null && newKey !in social.milestones) social.milestones.add(newKey)
+        }
+
+        // The legacy single-number affinity is a mirror of the social world, so a loaded save
+        // starts with the two in agreement — old saves included, whose opinions the migration
+        // built from their affinities in the first place.
+        for (npc in save.npcs) {
+            social.relationships["${npc.id}>$PLAYER_ID"]?.let { npc.affinity = legacyAffinity(it) }
+        }
+
+        // Households: references rewritten like everything else, members nothing defines
+        // reported and let go. Kin bonds are bound by their own system once the world exists.
+        for (hh in save.households) {
+            hh.home = content.buildings.canonical(hh.home).takeIf { content.buildings[it] != null } ?: ""
+            for (m in hh.members.toList()) {
+                val c = canonicalNpc(m)
+                if (c == null) {
+                    logUnresolved("person", m, false)
+                    hh.members.remove(m)
+                } else if (c != m) {
+                    hh.members.remove(m)
+                    hh.members.add(c)
+                }
+            }
+            if (hh.head.isNotEmpty()) hh.head = canonicalNpc(hh.head) ?: ""
+            hh.sanitize()
+        }
+        // A wish's target may be a person, a trade or a skill: a person reference is rewritten
+        // when one exists, anything else is kept as written.
+        for (npc in save.npcs) {
+            for (g in npc.goals) {
+                if (g.target.isEmpty()) continue
+                val c = canonicalNpc(g.target)
+                if (c != null) g.target = c
+                g.sanitize()
+            }
+        }
+    }
+}
